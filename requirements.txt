@@ -1,0 +1,2 @@
+# One tested runtime dependency set for local setup and Community Cloud.
+-r requirements.lock.txt

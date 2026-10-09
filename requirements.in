@@ -1,0 +1,11 @@
+# Runtime packages only. Resolve updates into requirements.lock.txt, then run tests.
+streamlit==1.65.0
+langchain==1.4.4
+langchain-chroma==1.1.0
+langchain-openai==1.7.0
+langchain-google-genai==4.4.0
+langchain-ollama==1.1.0
+langchain-text-splitters==1.1.3
+chromadb==1.5.9
+pypdf==6.19.0
+python-dotenv==1.2.4

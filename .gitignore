@@ -1,0 +1,16 @@
+.venv/
+.uv-cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+data/
+/*.pdf
+medibank_data/*
+!medibank_data/mpl-fund-rules.pdf
+!medibank_data/resident-member-guide.pdf
+*.log
