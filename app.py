@@ -1,4 +1,4 @@
-"""Run with: .venv/Scripts/python.exe -m streamlit run app.py."""
+m"""Run with: .venv/Scripts/python.exe -m streamlit run app.py."""
 
 from __future__ import annotations
 

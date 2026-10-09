@@ -32,13 +32,13 @@ NO_EVIDENCE_MESSAGE = (
 LEGACY_FALLBACK_MESSAGES = {
     "I can only use the PDFs to answer document questions.": OFF_TOPIC_MESSAGE,
     (
-        "I answer questions about the Medibank PDFs. Please ask about membership, "
+        "I answer questions about the Medibank Product Questions. Please ask about membership, "
         "benefits, claims, exclusions, or waiting periods."
     ): OFF_TOPIC_MESSAGE,
     "A human representative should help with this request.": HUMAN_REVIEW_MESSAGE,
     (
         "This needs personal account access or professional review, "
-        "which these PDFs cannot provide."
+        "which these general information cannot provide."
     ): PERSONAL_REVIEW_MESSAGE,
     (
         "The document evidence could not be checked. Please retry or request human review."
