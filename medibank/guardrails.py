@@ -30,7 +30,7 @@ NO_EVIDENCE_MESSAGE = (
 
 # Exact historical fallbacks only; never replace arbitrary conversation text.
 LEGACY_FALLBACK_MESSAGES = {
-    "I can only use the PDFs to answer document questions.": OFF_TOPIC_MESSAGE,
+    "I can only use the published information to answer document questions.": OFF_TOPIC_MESSAGE,
     (
         "I answer questions about the Medibank PDFs. Please ask about membership, "
         "benefits, claims, exclusions, or waiting periods."
