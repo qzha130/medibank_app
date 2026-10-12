@@ -186,3 +186,18 @@ def test_error_chain_honors_suppressed_context_and_stops_cycles():
     details = observability.format_error_chain(outer)
     assert details.count("RuntimeError: Reported failure") == 1
     assert details.count("ValueError: Suppressed internal details") == 1
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "{'token': 'private-quoted-token'}",
+        '{"api_key": "private-quoted-token"}',
+        r'{"secret": "private-quoted-token\"still-secret"}',
+    ],
+)
+def test_redact_quoted_credentials_in_exception_messages(message):
+    redacted = observability.redact(message)
+    assert "private-quoted-token" not in redacted
+    assert "still-secret" not in redacted
+    assert "[REDACTED]" in redacted

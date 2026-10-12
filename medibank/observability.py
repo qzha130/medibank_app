@@ -23,6 +23,11 @@ _INLINE_SECRET = re.compile(
     r"\bBearer\s+[^\s,;]+|"
     r"(?i:((?:api[_ -]?key|access[_ -]?token|token|password|authorization)\s*[:=]\s*))(?:Bearer\s+)?[^\s,;&]+"
 )
+_QUOTED_SECRET = re.compile(
+    r"""(?P<prefix>["'](?:api[_ -]?key|access[_ -]?token|token|secret|password|authorization)["']\s*[:=]\s*)"""
+    r"""(?P<quote>["'])(?:\\.|(?!(?P=quote))[^\\])*(?P=quote)""",
+    re.IGNORECASE,
+)
 
 
 def _directory(env: str, default: str) -> Path:
@@ -45,6 +50,10 @@ def redact(value):
             configured_key = os.getenv(name, "")
             if len(configured_key) >= 8:
                 value = value.replace(configured_key, "[REDACTED]")
+        value = _QUOTED_SECRET.sub(
+            lambda match: match["prefix"] + match["quote"] + "[REDACTED]" + match["quote"],
+            value,
+        )
         return _INLINE_SECRET.sub(lambda match: (match.group(1) or "") + "[REDACTED]", value)[:8000]
     if value is None or isinstance(value, (bool, int, float)):
         return value

@@ -8,6 +8,7 @@ import pytest
 from conftest import CountingEmbeddings, searchable_pdf
 from pypdf import PdfWriter
 
+import medibank.knowledge as knowledge
 from medibank.knowledge import PdfInput, build_index, discover_pdfs
 
 
@@ -139,6 +140,48 @@ def test_failed_embedding_build_can_be_retried(pdf_bytes, tmp_path):
     assert recovered.reused is False
     assert len(recovered.store.get()["ids"]) == recovered.chunk_count == 3
     assert build(inputs(pdf_bytes), embeddings, tmp_path).reused is True
+
+
+@pytest.mark.parametrize(
+    "failed_component,expected_operation",
+    [
+        ("chroma", "initializing Chroma"),
+        ("embedding", "embedding and storing PDF chunks 1-3"),
+    ],
+)
+def test_index_failure_logs_operation_and_redacted_nested_cause(
+    failed_component, expected_operation, pdf_bytes, tmp_path, monkeypatch, caplog
+):
+    secret = "private-configured-provider-credential"
+    monkeypatch.setenv("GEMINI_API_KEY", secret)
+    embeddings = CountingEmbeddings()
+
+    def fail(*args, **kwargs):
+        try:
+            raise ValueError(
+                f"Underlying failure; credential {secret}; token=private-token; "
+                "{'token': 'private-quoted-token'}"
+            )
+        except ValueError as cause:
+            raise RuntimeError("Provider or database operation failed") from cause
+
+    if failed_component == "chroma":
+        monkeypatch.setattr(knowledge, "Chroma", fail)
+    else:
+        monkeypatch.setattr(embeddings, "embed_documents", fail)
+
+    with caplog.at_level("ERROR", logger="medibank.knowledge"):
+        with pytest.raises(RuntimeError, match="index could not be completed") as failure:
+            build(inputs(pdf_bytes), embeddings, tmp_path)
+
+    assert f"PDF index failed while {expected_operation}" in caplog.text
+    assert "Caused by: ValueError: Underlying failure" in caplog.text
+    assert "[REDACTED]" in caplog.text
+    assert secret not in caplog.text
+    assert "private-token" not in caplog.text
+    assert "private-quoted-token" not in caplog.text
+    assert secret not in str(failure.value)
+    assert not list(tmp_path.glob("*/manifest.json"))
 
 
 def test_interrupted_multibatch_build_recovers_without_duplicate_chunks(

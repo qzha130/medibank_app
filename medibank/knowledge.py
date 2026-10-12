@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import tempfile
@@ -21,6 +22,8 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
+
+from medibank.observability import format_error_chain
 
 MAX_PDF_BYTES = 50 * 1024 * 1024
 INDEX_VERSION = 1
@@ -341,6 +344,7 @@ def build_index(
     }
     expected_ids = set(ids)
     with _index_lock(dataset_directory / "index.lock"):
+        operation = "initializing Chroma"
         try:
             store = Chroma(
                 collection_name=COLLECTION_NAME,
@@ -349,27 +353,39 @@ def build_index(
                 client_settings=Settings(anonymized_telemetry=False),
                 collection_metadata={"hnsw:space": "cosine"},
             )
+            operation = "reading saved vectors"
             existing_ids = set(store.get(include=[])["ids"])
             reused = _read_manifest(manifest_path) == manifest and existing_ids == expected_ids
             if not reused:
                 # Removing only the completion marker ensures failures remain retryable.
+                operation = "removing the incomplete index marker"
                 manifest_path.unlink(missing_ok=True)
                 unexpected_ids = sorted(existing_ids - expected_ids)
+                operation = "removing stale vectors"
                 for start in range(0, len(unexpected_ids), INDEX_BATCH_SIZE):
                     store.delete(ids=unexpected_ids[start : start + INDEX_BATCH_SIZE])
                 # Re-embed every expected chunk when the manifest is incomplete:
                 # this also repairs entries written by an interrupted upsert.
                 for start in range(0, len(chunks), INDEX_BATCH_SIZE):
+                    operation = (
+                        "embedding and storing PDF chunks "
+                        f"{start + 1}-{min(start + INDEX_BATCH_SIZE, len(chunks))}"
+                    )
                     store.add_documents(
                         documents=chunks[start : start + INDEX_BATCH_SIZE],
                         ids=ids[start : start + INDEX_BATCH_SIZE],
                     )
+                operation = "verifying saved vectors"
                 if set(store.get(include=[])["ids"]) != expected_ids:
                     raise RuntimeError(
                         "Chroma did not persist the expected complete chunk inventory."
                     )
+                operation = "writing the completed index marker"
                 _write_manifest(manifest_path, manifest)
         except Exception as exc:
+            logging.getLogger(__name__).error(
+                "PDF index failed while %s: %s", operation, format_error_chain(exc)
+            )
             raise RuntimeError(
                 "The PDF index could not be completed. Check the embedding service/model "
                 "and that the Chroma folder is writable, then retry."
