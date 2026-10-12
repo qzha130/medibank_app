@@ -25,11 +25,7 @@ EMBEDDING_PROVIDER=ollama
 OLLAMA_EMBEDDING_MODEL=nomic-embed-text
 ```
 
-To use Gemini embeddings as well, open **Vector Database**, select **Gemini · online** as the index embedding provider, use `gemini-embedding-001`, and build a new index. Select matching embedding settings on the chatbot page to query that index. This integration uses the Gemini Developer API through Google AI Studio. The current LangChain adapter supports `gemini-embedding-001` and rejects Gemini Embedding 2. Keys stay with their selected online provider.
 
-If Gemini reports a Vertex AI or Enterprise configuration conflict, unset `GOOGLE_GENAI_USE_VERTEXAI` and `GOOGLE_GENAI_USE_ENTERPRISE`, or set them to `false`, then restart Streamlit.
-
-The default PDF folder is `medibank_data`. Git includes one copy of the two knowledge documents so the public app can rebuild Chroma. Root-level duplicate PDFs and generated indexes are excluded. Manage PDF folders, uploads, and indexing in the local **Vector Database** page. Each PDF can be up to 50 MB and must have a different filename. Start the UI:
 
 ```powershell
 .\run.ps1
