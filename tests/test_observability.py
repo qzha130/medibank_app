@@ -155,3 +155,34 @@ def test_audit_storage_error_does_not_crash_the_application(local_records, monke
     blocked.write_text("A file occupies the configured log directory.", encoding="utf-8")
     monkeypatch.setenv("LOG_DIRECTORY", str(blocked))
     assert observability.audit("test_event") is None
+
+
+def test_error_chain_includes_implicit_cause_and_redacts_credentials(monkeypatch):
+    secret = "private-configured-provider-credential"
+    monkeypatch.setenv("GEMINI_API_KEY", secret)
+    try:
+        try:
+            raise OSError(f"403 PERMISSION_DENIED {secret}; token=private-url-token")
+        except OSError:
+            raise RuntimeError("Index initialization failed")
+    except RuntimeError as error:
+        details = observability.format_error_chain(error)
+
+    assert "RuntimeError: Index initialization failed" in details
+    assert "Caused by: OSError: 403 PERMISSION_DENIED" in details
+    assert secret not in details
+    assert "private-url-token" not in details
+
+
+def test_error_chain_honors_suppressed_context_and_stops_cycles():
+    hidden = ValueError("Suppressed internal details")
+    outer = RuntimeError("Reported failure")
+    outer.__context__ = hidden
+    outer.__suppress_context__ = True
+    assert observability.format_error_chain(outer) == "RuntimeError: Reported failure"
+
+    outer.__cause__ = hidden
+    hidden.__cause__ = outer
+    details = observability.format_error_chain(outer)
+    assert details.count("RuntimeError: Reported failure") == 1
+    assert details.count("ValueError: Suppressed internal details") == 1

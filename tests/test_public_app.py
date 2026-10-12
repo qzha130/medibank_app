@@ -150,3 +150,30 @@ def test_public_entry_point_fails_closed_when_key_missing(monkeypatch):
     assert not at.exception
     assert any("not ready" in error.value for error in at.error)
     assert not at.chat_input
+
+
+def test_startup_logs_redacted_provider_cause_without_exposing_it_to_visitors(
+    public_ui, monkeypatch, caplog
+):
+    import medibank.deployment
+
+    at, _, secret = public_ui
+
+    def failed_index(settings):
+        try:
+            raise ValueError(f"429 RESOURCE_EXHAUSTED; credential {secret}")
+        except ValueError as cause:
+            raise RuntimeError("The PDF index could not be completed.") from cause
+
+    monkeypatch.setattr(medibank.deployment, "prepare_public_index", failed_index)
+    with caplog.at_level("ERROR", logger="medibank.deployment"):
+        at.run()
+
+    assert not at.exception
+    assert any("not ready" in error.value for error in at.error)
+    assert not at.chat_input
+    assert "Caused by: ValueError: 429 RESOURCE_EXHAUSTED" in caplog.text
+    assert "[REDACTED]" in caplog.text
+    assert secret not in caplog.text
+    assert secret not in str(at)
+    assert "RESOURCE_EXHAUSTED" not in str(at)

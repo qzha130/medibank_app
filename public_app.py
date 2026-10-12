@@ -11,7 +11,7 @@ import streamlit as st
 from medibank.deployment import prepare_public_index, read_public_settings
 from medibank.knowledge import discover_pdfs
 from medibank.limits import RequestLimiter
-from medibank.observability import audit, redact
+from medibank.observability import audit, format_error_chain
 
 # Both direct admin-page guards and this explicit page registry enforce public mode.
 os.environ["APP_PUBLIC_MODE"] = "true"
@@ -39,10 +39,14 @@ def public_chat() -> None:
             index, limiter = public_resources(settings, corpus_signature)
     except Exception as error:
         os.environ["APP_PUBLIC_MODE"] = "true"
-        audit("public_startup_failed", level="ERROR", error_type=type(error).__name__)
-        logging.getLogger("medibank.deployment").error(
-            "Public startup failed: %s", redact(str(error))
+        error_details = format_error_chain(error)
+        audit(
+            "public_startup_failed",
+            level="ERROR",
+            error_type=type(error).__name__,
+            error=error_details,
         )
+        logging.getLogger("medibank.deployment").error("Public startup failed: %s", error_details)
         st.title("Medibank Assistant")
         st.error(
             "The assistant is not ready. The app owner needs to check its deployment settings."

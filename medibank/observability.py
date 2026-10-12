@@ -51,6 +51,17 @@ def redact(value):
     return redact(str(value))
 
 
+def format_error_chain(error: BaseException) -> str:
+    """Expose nested failure causes to operators without logging raw credentials."""
+    messages = []
+    seen: set[int] = set()
+    while error is not None and id(error) not in seen and len(messages) < 10:
+        seen.add(id(error))
+        messages.append(f"{type(error).__name__}: {redact(str(error))}")
+        error = error.__cause__ or (error.__context__ if not error.__suppress_context__ else None)
+    return redact("\nCaused by: ".join(messages))
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 

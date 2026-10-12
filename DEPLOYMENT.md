@@ -55,3 +55,5 @@ Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`, replace its
 Use a separate process from the local app. For the normal local administration UI, keep using `./run.ps1` on port 8502.
 
 If startup fails, check Community Cloud's owner-only runtime logs and the deployment secret names. Common causes are a missing key, unavailable model or exhausted quota, missing documents, or incompatible Python dependencies. Public visitors see a generic startup message rather than exception details or credentials. Backend module edits require a server restart to load new code.
+
+Look for `Public startup failed` and its `Caused by` lines in Cloud logs. These include redacted nested provider or database errors even when PDF index construction wraps them in a generic error. For example, `429 RESOURCE_EXHAUSTED` identifies an embedding quota failure, while a Chroma or filesystem exception identifies a local storage problem. Copy these diagnostic lines without credentials when requesting help. The recommended Python version is 3.12; a successful dependency installation on a newer runtime does not verify index compatibility.
