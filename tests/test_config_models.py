@@ -1,5 +1,6 @@
 """Provider boundaries protect index compatibility and avoid startup requests."""
 
+import json
 import os
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ import pytest
 from google import genai
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_google_genai import chat_models as google_chat_models
 from langchain_google_genai import embeddings as google_embeddings
 
 from medibank.config import ProviderConfig, embedding_identity
@@ -274,3 +276,64 @@ def test_gemini_embedding_2_has_a_clear_adapter_compatibility_error(model):
                 "gemini", model, "https://generativelanguage.googleapis.com", "offline-key"
             )
         )
+
+
+@pytest.mark.parametrize(
+    "model_name,supports_summary",
+    [
+        ("gemini-3.8-flash", True),
+        ("models/gemini-3.8-flash", True),
+        ("gemini-2.5-flash", True),
+        ("gemini-2.0-flash", False),
+    ],
+)
+def test_gemini_requests_supplied_summaries_only_for_supported_models(
+    monkeypatch, model_name, supports_summary
+):
+    requests = []
+
+    def respond(request):
+        requests.append(json.loads(request.content))
+        parts = [{"text": "The answer from the model."}]
+        if supports_summary:
+            parts.insert(0, {"text": "A supplied reasoning summary.", "thought": True})
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "content": {"role": "model", "parts": parts},
+                        "finishReason": "STOP",
+                    }
+                ],
+                "modelVersion": model_name.removeprefix("models/"),
+            },
+            request=request,
+        )
+
+    transport = httpx.MockTransport(respond)
+
+    def offline_client(**kwargs):
+        options = kwargs["http_options"]
+        options.client_args = {**(options.client_args or {}), "transport": transport}
+        options.async_client_args = {**(options.async_client_args or {}), "transport": transport}
+        return genai.Client(**kwargs)
+
+    monkeypatch.setattr(google_chat_models, "Client", offline_client)
+    model = create_chat_model(
+        ProviderConfig("gemini", model_name, "http://127.0.0.1:9", "offline-key")
+    )
+    try:
+        response = model.invoke("What is covered?")
+        thinking_config = requests[0]["generationConfig"].get("thinkingConfig")
+        if supports_summary:
+            assert thinking_config == {"include_thoughts": True}
+            assert any(
+                block["type"] == "thinking" and block["thinking"] == "A supplied reasoning summary."
+                for block in response.content
+            )
+        else:
+            assert thinking_config is None
+        assert response.text == "The answer from the model."
+    finally:
+        model.client.close()

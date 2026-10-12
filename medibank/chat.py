@@ -5,13 +5,21 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from queue import Empty, SimpleQueue
 from threading import Lock
 from typing import Any
 
 from langchain.agents import create_agent
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    HumanMessage,
+    ToolMessage,
+)
 from langchain_core.tools import tool
 from langgraph.errors import GraphRecursionError
 
@@ -24,6 +32,7 @@ from medibank.retrieval import expand_page_context
 class Answer:
     text: str
     sources: list[dict[str, Any]]
+    reasoning: list[str] = field(default_factory=list)
 
 
 class ChatError(RuntimeError):
@@ -31,7 +40,7 @@ class ChatError(RuntimeError):
 
 
 SYSTEM_PROMPT = f"""You are a Medibank assistant who answers general questions about Medibank.
-Your evidence comes from the user's indexed Medibank PDFs.
+Your evidence comes from the user's indexed Medibank Public information.
 The current user message is a JSON object with a question and retrieved_passages.
 Answer its question using only information supported by those passages or by
 search_knowledge_base results. Search again if a follow-up needs different evidence.
@@ -92,6 +101,23 @@ _FOLLOWUP = re.compile(
     r"^(and\b|what about\b|how about\b|also\b)",
     re.IGNORECASE,
 )
+_THINKING = re.compile(
+    r"<think(?:ing)?\b[^>]*>(.*?)(?:</think(?:ing)?\s*>|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def split_reasoning_text(text: str) -> tuple[str, list[str]]:
+    """Separate provider think tags, including unfinished spans, from visible text."""
+    reasoning = []
+
+    def remove(match: re.Match) -> str:
+        thought = match.group(1).strip()
+        if thought:
+            reasoning.append(thought)
+        return "\n"
+
+    return _THINKING.sub(remove, text).strip(), reasoning
 
 
 def _recent_history(history: list[dict]) -> list[dict[str, str]]:
@@ -101,6 +127,10 @@ def _recent_history(history: list[dict]) -> list[dict[str, str]]:
     for message in reversed(history[-8:]):
         role, content = message.get("role"), message.get("content")
         if role in {"user", "assistant"} and isinstance(content, str) and content.strip():
+            if role == "assistant":
+                content, _ = split_reasoning_text(content)
+                if not content:
+                    continue
             # Preserve several recent turns rather than one very long model answer.
             content = content[: min(1000, remaining)]
             result.append({"role": role, "content": content})
@@ -143,16 +173,100 @@ def _passage(document: Any) -> dict[str, Any] | None:
 def _message_text(message: BaseMessage) -> str:
     """Support string content and provider text blocks without returning reasoning."""
     if isinstance(message.content, str):
-        return message.content.strip()
+        return split_reasoning_text(message.content)[0]
     parts = []
     for block in message.content:
         if isinstance(block, str):
             parts.append(block)
-        elif isinstance(block, dict) and block.get("type") in {"text", "output_text"}:
+        elif (
+            isinstance(block, dict)
+            and block.get("type") in {"text", "output_text"}
+            and block.get("thought") is not True
+        ):
             value = block.get("text")
             if isinstance(value, str):
                 parts.append(value)
-    return "\n".join(parts).strip()
+    return split_reasoning_text("\n".join(parts))[0]
+
+
+def _reasoning_text(value: Any) -> list[str]:
+    """Read explicit plaintext reasoning fields; never stringify opaque payloads."""
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, list):
+        return [text for item in value for text in _reasoning_text(item)]
+    if isinstance(value, dict):
+        if value.get("type") not in {
+            None,
+            "reasoning",
+            "thinking",
+            "text",
+            "summary_text",
+            "reasoning_text",
+        }:
+            return []
+        return [
+            text
+            for key in ("reasoning", "thinking", "text", "summary", "content")
+            for text in _reasoning_text(value.get(key))
+        ]
+    return []
+
+
+def _message_reasoning(message: AIMessage) -> list[str]:
+    """Extract only plaintext reasoning the provider returned for this message."""
+    reasoning = []
+    if isinstance(message.content, str):
+        reasoning.extend(split_reasoning_text(message.content)[1])
+    else:
+        text_parts = []
+
+        def collect_tagged_thoughts() -> None:
+            reasoning.extend(split_reasoning_text("\n".join(text_parts))[1])
+            text_parts.clear()
+
+        for block in message.content:
+            if isinstance(block, str):
+                text_parts.append(block)
+            elif isinstance(block, dict):
+                if block.get("type") in {"reasoning", "thinking"}:
+                    collect_tagged_thoughts()
+                    reasoning.extend(_reasoning_text(block))
+                elif block.get("type") in {"text", "output_text"}:
+                    value = block.get("text")
+                    if isinstance(value, str):
+                        if block.get("thought") is True:
+                            collect_tagged_thoughts()
+                            reasoning.extend(_reasoning_text(value))
+                        else:
+                            text_parts.append(value)
+        collect_tagged_thoughts()
+    for key in ("reasoning_content", "thinking", "reasoning", "reasoning_summary"):
+        reasoning.extend(_reasoning_text(message.additional_kwargs.get(key)))
+    # Some providers return the same plaintext in both a block and extra fields.
+    return list(dict.fromkeys(reasoning))
+
+
+def _new_reasoning(result: dict, input_count: int) -> list[str]:
+    """LangGraph returns history plus generated messages; inspect only the latter."""
+    return [
+        text
+        for message in result.get("messages", [])[input_count:]
+        if isinstance(message, AIMessage)
+        for text in _message_reasoning(message)
+    ]
+
+
+def _hold_partial_think_tag(text: str) -> str:
+    """Don't publish a closing delimiter before its remaining tokens arrive."""
+    position = text.rfind("<")
+    if position >= 0:
+        suffix = text[position:].casefold()
+        if any(
+            tag.startswith(suffix) for tag in ("<think>", "</think>", "<thinking>", "</thinking>")
+        ):
+            return text[:position].rstrip()
+    return text
 
 
 def _model_error(error: Exception) -> ChatError:
@@ -216,11 +330,15 @@ def answer_question(
     top_k: int = 5,
     request_id: str | None = None,
     session_id: str | None = None,
+    on_progress: Callable[[dict[str, str]], None] | None = None,
 ) -> Answer:
     """Retrieve on every turn, then let the agent search further before answering.
 
     The caller owns history and provider clients. All evidence and agent state are
     local to this invocation, so sessions cannot share conversations or citations.
+    Optional progress runs on the calling thread and contains processing steps or
+    append-only reasoning deltas, never unvalidated answer text. A failed progress
+    callback is disabled while the answer continues normally.
     """
     question = question.strip()
     if not question:
@@ -229,6 +347,97 @@ def answer_question(
         raise ValueError("Please keep the question under 4,000 characters.")
     if not 1 <= top_k <= 20:
         raise ValueError("Choose between 1 and 20 retrieved passages.")
+
+    use_stream = on_progress is not None
+    progress_queue: SimpleQueue[str] = SimpleQueue()
+    reasoning_started = False
+
+    def notify(kind: str, value: str) -> None:
+        nonlocal on_progress
+        if on_progress is not None and value:
+            try:
+                on_progress({"type": kind, "text": value})
+            except Exception:
+                # UI failures must not discard a valid answer or reveal error data.
+                on_progress = None
+
+    def drain_progress() -> None:
+        while True:
+            try:
+                notify("step", progress_queue.get_nowait())
+            except Empty:
+                break
+
+    def run_agent(agent: Any, inputs: list[BaseMessage]) -> dict:
+        nonlocal reasoning_started
+        if not use_stream:
+            return agent.invoke({"messages": inputs}, config={"recursion_limit": 12})
+        notify("step", "The model is reviewing the available Medibank information.")
+        result: dict = {"messages": inputs}
+        chunks: dict[str, AIMessageChunk] = {}
+        emitted: dict[str, str] = {}
+        completed: set[str] = set()
+        received_text: set[str] = set()
+        reviewed_tools: set[str] = set()
+
+        def publish_reasoning(message: AIMessage, key: str) -> None:
+            nonlocal reasoning_started
+            current = "\n".join(
+                _hold_partial_think_tag(text) for text in _message_reasoning(message)
+            ).rstrip()
+            previous = emitted.get(key, "")
+            if current.startswith(previous) and len(current) > len(previous):
+                delta = current[len(previous) :]
+                if not previous and reasoning_started:
+                    delta = "\n\n" + delta
+                notify("reasoning", delta)
+                emitted[key] = current
+                reasoning_started = True
+
+        try:
+            # Values preserves the provider's complete native messages/signatures;
+            # messages yields model chunks while the same graph is still running.
+            for mode, payload in agent.stream(
+                {"messages": inputs},
+                config={"recursion_limit": 12},
+                stream_mode=["messages", "values"],
+                version="v1",
+            ):
+                drain_progress()
+                if mode == "messages":
+                    message, metadata = payload
+                    if not isinstance(message, AIMessage):
+                        continue
+                    key = message.id or str(metadata.get("langgraph_step", "model"))
+                    if isinstance(message, AIMessageChunk):
+                        chunks[key] = chunks[key] + message if key in chunks else message
+                        publish_reasoning(chunks[key], key)
+                    else:
+                        publish_reasoning(message, key)
+                    if key not in received_text and _message_text(message):
+                        notify("step", "Receiving the model response.")
+                        received_text.add(key)
+                elif mode == "values" and isinstance(payload, dict):
+                    result = payload
+                    generated = payload.get("messages", [])[len(inputs) :]
+                    if generated and isinstance(generated[-1], ToolMessage):
+                        tool_key = generated[-1].id or str(id(generated[-1]))
+                        if tool_key not in reviewed_tools:
+                            notify("step", "The model is reviewing the additional information.")
+                            reviewed_tools.add(tool_key)
+                    for message in generated:
+                        if not isinstance(message, AIMessage):
+                            continue
+                        key = message.id or str(id(message))
+                        if key in completed:
+                            continue
+                        publish_reasoning(message, key)
+                        completed.add(key)
+                        if message.tool_calls:
+                            notify("step", "The model requested an additional information search.")
+        finally:
+            drain_progress()
+        return result
 
     recent = _recent_history(history)
     evidence: dict[tuple[str, int | None, str], dict[str, Any]] = {}
@@ -267,11 +476,19 @@ def answer_question(
                 remaining_passage_chars -= cost
                 evidence[key] = passage
                 passages.append(passage)
+        if use_stream:
+            count = len(passages)
+            noun = "passage" if count == 1 else "passages"
+            # Tools can run in worker threads. Only the main stream loop calls UI.
+            progress_queue.put(f"Retrieved {count} new Medibank {noun}.")
         return passages
 
     # This happens in code before the model runs, so it cannot skip retrieval.
+    notify("step", "Searching the indexed Medibank information.")
     initial = retrieve(_retrieval_query(question, recent))
+    drain_progress()
     if not initial:
+        notify("step", "No relevant information was found.")
         return Answer(text=_NO_EVIDENCE, sources=[])
 
     searches = 0
@@ -295,6 +512,8 @@ def answer_question(
                     {"status": "Search limit reached. Answer from retrieved evidence."}
                 )
             searches += 1
+        if use_stream:
+            progress_queue.put("Searching for additional Medibank information.")
         passages = retrieve(query[:2000])
         return json.dumps(
             {
@@ -329,7 +548,7 @@ def answer_question(
             tools=[search_knowledge_base],
             system_prompt=SYSTEM_PROMPT,
         )
-        result = agent.invoke({"messages": messages}, config={"recursion_limit": 12})
+        result = run_agent(agent, messages)
     except GraphRecursionError:
         raise ChatError(
             "The agent reached its search limit. Please try a more specific question."
@@ -340,9 +559,12 @@ def answer_question(
         raise _model_error(error) from None
 
     text = _completed_answer(result)
+    reasoning = _new_reasoning(result, len(messages))
     allowed = {item["citation"] for item in evidence.values()}
+    notify("step", "Checking the answer's source citations.")
     citations = _valid_citations(text, allowed)
     if not citations and not _abstention_only(text):
+        notify("step", "Revising the answer to include verifiable source citations.")
         audit("citation_revision_started", session_id=session_id, request_id=request_id)
         # Give a model one chance to ground its own answer; never append arbitrary
         # source labels in application code. The revision has no search tools.
@@ -358,13 +580,15 @@ def answer_question(
         )
         try:
             repair_agent = create_agent(model=model, tools=[], system_prompt=SYSTEM_PROMPT)
-            repaired = repair_agent.invoke(
-                {"messages": [*result["messages"], revision]},
-                config={"recursion_limit": 12},
-            )
+            # Keep native signatures and provider blocks for this same-turn repair.
+            # Only displayed answers and future user-turn history omit reasoning.
+            repair_messages = [*result["messages"], revision]
+            repaired = run_agent(repair_agent, repair_messages)
         except Exception as error:
             raise _model_error(error) from None
         text = _completed_answer(repaired)
+        reasoning.extend(_new_reasoning(repaired, len(repair_messages)))
+        notify("step", "Checking the revised answer's source citations.")
         citations = _valid_citations(text, allowed)
         if not citations and not _abstention_only(text):
             audit(
@@ -381,4 +605,5 @@ def answer_question(
         {"source": item["source"], "page": item["page"], "excerpt": item["excerpt"]}
         for item in evidence.values()
     ]
-    return Answer(text=text, sources=sources)
+    notify("step", "The answer is ready.")
+    return Answer(text=text, sources=sources, reasoning=reasoning)

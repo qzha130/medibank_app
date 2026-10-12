@@ -50,6 +50,8 @@ def ui(monkeypatch, tmp_path):
         "pdf_directory": pdf_directory,
         "embedding_configs": [],
         "chat_configs": [],
+        "reasoning": [],
+        "progress_probe": None,
     }
 
     def fake_find(directory, config, preferred_id=None):
@@ -71,6 +73,8 @@ def ui(monkeypatch, tmp_path):
 
     def fake_answer(**kwargs):
         state["chat_calls"].append(kwargs)
+        if state["progress_probe"]:
+            state["progress_probe"](kwargs.get("on_progress"))
         if state["chat_error"]:
             raise ChatError("The chat model request failed. Check the connection.")
         return Answer(
@@ -78,6 +82,7 @@ def ui(monkeypatch, tmp_path):
             sources=[
                 {"source": "extras.pdf", "page": 1, "excerpt": "Dental check-ups are covered."}
             ],
+            reasoning=state["reasoning"],
         )
 
     def fake_embeddings(config):
@@ -178,7 +183,7 @@ def test_chat_error_can_be_retried_without_poisoning_history(ui, pdf_bytes):
     at.chat_input[0].set_value("Are dental check-ups covered?").run()
     assert not at.exception
     assert [message["role"] for message in at.session_state["messages"]] == ["user", "assistant"]
-    assert any("Sources" in expander.label for expander in at.expander)
+    assert not any(expander.label.startswith("Sources") for expander in at.expander)
     widget(at.button, "Clear conversation").click().run()
     assert at.session_state["messages"] == []
     assert at.chat_input[0].disabled is False
@@ -423,21 +428,110 @@ def test_chat_model_settings_survive_visiting_vector_database(ui, pdf_bytes):
 
 def test_agent_activity_can_be_shown_and_hidden_without_repeating_model_calls(ui, pdf_bytes):
     at, state = ui
+    state["reasoning"] = ["The retrieved passage supports this claim."]
     add_pdfs(state, pdf_bytes)
     at.run()
-    assert widget(at.toggle, "Show agent activity").value is False
+    assert widget(at.toggle, "Show processing steps").value is False
     at.chat_input[0].set_value("How do I make a claim?").run()
     assert not at.exception
-    assert not any(item.label == "Agent activity" for item in at.expander)
+    assert not any(item.label == "Processing steps" for item in at.expander)
+    assert not any(state["reasoning"][0] in item.value for item in at.text)
     saved_activity = at.session_state["messages"][-1]["activity"]
     assert any(row["Activity"] == "Response completed" for row in saved_activity)
-    widget(at.toggle, "Show agent activity").set_value(True).run()
-    assert any(item.label == "Agent activity" for item in at.expander)
-    assert len(at.dataframe) == 1
-    widget(at.toggle, "Show agent activity").set_value(False).run()
-    assert not any(item.label == "Agent activity" for item in at.expander)
+    widget(at.toggle, "Show processing steps").set_value(True).run()
+    assert any(item.label == "Processing steps" for item in at.expander)
+    assert any(state["reasoning"][0] in item.value for item in at.text)
+    assert not at.dataframe
+    widget(at.toggle, "Show processing steps").set_value(False).run()
+    assert not any(item.label == "Processing steps" for item in at.expander)
+    assert not any(state["reasoning"][0] in item.value for item in at.text)
     assert len(state["chat_calls"]) == 1
+    assert len(state["load_calls"]) == 1
     assert at.session_state["messages"][-1]["activity"] == saved_activity
+    assert at.session_state["messages"][-1]["reasoning"] == state["reasoning"]
+
+
+def test_legacy_think_tags_are_visible_only_when_processing_steps_are_enabled(ui):
+    at, state = ui
+    at.session_state["messages"] = [
+        {
+            "role": "assistant",
+            "content": "<think>Saved model reasoning.</think>Dental is covered. [extras.pdf, p. 1]",
+        }
+    ]
+    at.run()
+    assert not at.exception
+    assert not any("Saved model reasoning." in item.value for item in at.text)
+    assert any("Dental is covered." in item.value for item in at.markdown)
+    assert at.session_state["messages"][0]["content"] == ("Dental is covered. [extras.pdf, p. 1]")
+    widget(at.toggle, "Show processing steps").set_value(True).run()
+    assert not at.exception
+    assert any("Saved model reasoning." in item.value for item in at.text)
+    assert at.session_state["messages"][0]["reasoning"] == ["Saved model reasoning."]
+    assert state["chat_calls"] == []
+
+
+def test_processing_window_updates_before_the_answer_returns(ui, pdf_bytes, monkeypatch):
+    from streamlit.delta_generator import DeltaGenerator
+
+    at, state = ui
+    add_pdfs(state, pdf_bytes)
+    rendered = []
+    original_text = DeltaGenerator.text
+
+    def observe_text(self, body, *args, **kwargs):
+        rendered.append(str(body))
+        return original_text(self, body, *args, **kwargs)
+
+    monkeypatch.setattr(DeltaGenerator, "text", observe_text)
+    state["progress_seen_before_return"] = False
+
+    def probe(callback):
+        assert callback is not None
+        callback({"type": "step", "text": "Model request started."})
+        assert any("Model request started." in text for text in rendered)
+        callback({"type": "reasoning", "text": "Checking the "})
+        callback({"type": "reasoning", "text": "claim information."})
+        callback({"type": "step", "text": "Validating the response."})
+        assert any("Checking the claim information." in text for text in rendered)
+        assert not at.session_state["messages"]
+        state["progress_seen_before_return"] = True
+
+    state["progress_probe"] = probe
+    at.run()
+    widget(at.toggle, "Show processing steps").set_value(True).run()
+    at.chat_input[0].set_value("How do I make a claim?").run()
+    assert not at.exception
+    assert state["progress_seen_before_return"] is True
+    saved = at.session_state["messages"][-1]
+    assert "Checking the claim information." in saved["processing_log"]
+    assert "Response completed." in saved["processing_log"]
+    assert any(saved["processing_log"].strip() == element.value for element in at.text)
+    assert not any(expander.label.startswith("Sources") for expander in at.expander)
+
+
+def test_processing_off_disables_live_callbacks_and_logs_stay_bounded(ui, pdf_bytes):
+    at, state = ui
+    add_pdfs(state, pdf_bytes)
+    state["callbacks"] = []
+    state["progress_probe"] = lambda callback: state["callbacks"].append(callback)
+    at.run()
+    at.chat_input[0].set_value("How do I make a claim?").run()
+    assert not at.exception
+    assert state["callbacks"] == [None]
+    assert not any(expander.label == "Processing steps" for expander in at.expander)
+
+    def probe(callback):
+        callback({"type": "reasoning", "text": "x" * 10000})
+        callback({"type": "step", "text": "Recent progress marker."})
+
+    state["progress_probe"] = probe
+    widget(at.toggle, "Show processing steps").set_value(True).run()
+    at.chat_input[0].set_value("What waiting periods apply?").run()
+    assert not at.exception
+    log_text = at.session_state["messages"][-1]["processing_log"]
+    assert len(log_text) <= 8000
+    assert "Recent progress marker." in log_text
 
 
 def test_failed_attempt_activity_survives_toggle_and_successful_retry_clears_it(ui, pdf_bytes):
@@ -450,9 +544,9 @@ def test_failed_attempt_activity_survives_toggle_and_successful_retry_clears_it(
     assert at.session_state["messages"] == []
     failed = at.session_state["last_chat_error"]
     assert any(row["Activity"] == "Response unavailable" for row in failed["activity"])
-    widget(at.toggle, "Show agent activity").set_value(True).run()
+    widget(at.toggle, "Show processing steps").set_value(True).run()
     assert not at.exception
-    assert any(item.label == "Agent activity" for item in at.expander)
+    assert any(item.label == "Processing steps" for item in at.expander)
     assert any("request failed" in item.value for item in at.error)
     state["chat_error"] = False
     at.chat_input[0].set_value("How do I make a claim?").run()
@@ -484,9 +578,9 @@ def test_activity_option_survives_page_navigation_and_keeps_simple_default_scree
     assert not at.metric
     assert any(item.label == "Model settings" for item in at.expander)
     assert any(title.value == "Medibank Assistant" for title in at.title)
-    widget(at.toggle, "Show agent activity").set_value(True).run()
+    widget(at.toggle, "Show processing steps").set_value(True).run()
     at.switch_page("pages/1_Vector_Database.py").run()
     at.switch_page("app.py").run()
     assert not at.exception
-    assert widget(at.toggle, "Show agent activity").value is True
+    assert widget(at.toggle, "Show processing steps").value is True
     assert len(state["load_calls"]) == 1

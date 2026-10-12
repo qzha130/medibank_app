@@ -1,4 +1,4 @@
-m"""Run with: .venv/Scripts/python.exe -m streamlit run app.py."""
+"""Run with: .venv/Scripts/python.exe -m streamlit run app.py."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from medibank.activity import request_activity
-from medibank.chat import Answer, ChatError, _abstention_only, answer_question
+from medibank.chat import Answer, ChatError, _abstention_only, answer_question, split_reasoning_text
 from medibank.config import ProviderConfig, embedding_identity
 from medibank.deployment import PublicSettings, public_mode
 from medibank.guardrails import LEGACY_FALLBACK_MESSAGES, assess_question
@@ -21,7 +21,7 @@ from medibank.knowledge import IndexResult
 from medibank.limits import RequestLimiter
 from medibank.loading import find_saved_index, load_saved_index
 from medibank.models import create_chat_model, create_embeddings
-from medibank.observability import audit, create_handoff, list_handoffs
+from medibank.observability import audit, create_handoff, list_handoffs, redact
 
 PROJECT_DIR = Path(__file__).resolve().parent
 if not public_mode():
@@ -54,19 +54,6 @@ def answer_markdown(text: str, sources: list[dict] | None = None) -> str:
         label = Path(filename).stem.replace("-", " ").replace("_", " ").title()
         text = text.replace(f"[{filename}, p. {source['page']}]", f"[{label}, p. {source['page']}]")
     return text.replace("![", r"\![")
-
-
-def show_sources(sources: list[dict]) -> None:
-    if not sources:
-        return
-    with st.expander(f"Sources · {len(sources)}"):
-        st.caption("Information used for this answer.")
-        for source in sources:
-            page = f" · page {source['page']}" if source.get("page") else ""
-            st.caption(
-                f"{Path(source['source']).stem.replace('-', ' ').replace('_', ' ').title()}{page}"
-            )
-            st.text(source["excerpt"])
 
 
 def handoff_for(question: str, reason: str, session_id: str, public: bool) -> dict:
@@ -104,15 +91,30 @@ def show_activity(message: dict, enabled: bool, session_id: str) -> None:
     activity = message.get("activity")
     if activity is None:
         activity = request_activity(message.get("request_id"), session_id)
-    with st.expander("Agent activity", expanded=True):
-        if activity:
-            st.dataframe(activity, hide_index=True, width="stretch")
+    with st.expander("Processing steps", expanded=True):
+        log_text = message.get("processing_log")
+        if not log_text:
+            lines = [
+                f"{row.get('Time (UTC)', '')}  {row['Activity']} · {row['Details']}"
+                for row in activity or []
+            ]
+            if message.get("reasoning"):
+                lines.append("\nModel-provided reasoning:\n" + "\n\n".join(message["reasoning"]))
+            log_text = "\n".join(lines)
+        if log_text:
+            with st.container(height=220, autoscroll=True):
+                st.text(redact(log_text[-8000:]))
         else:
-            st.caption("Activity is available for new replies.")
+            st.caption("Processing steps are available for new replies.")
 
 
 def remember_error(
-    question: str, request_id: str, text: str, ticket: dict | None, enabled: bool
+    question: str,
+    request_id: str,
+    text: str,
+    ticket: dict | None,
+    enabled: bool,
+    processing_log: str = "",
 ) -> None:
     message = {
         "question": question,
@@ -120,6 +122,7 @@ def remember_error(
         "handoff": ticket,
         "request_id": request_id,
         "activity": request_activity(request_id, st.session_state["session_id"]),
+        "processing_log": processing_log,
     }
     st.session_state["last_chat_error"] = message
     show_activity(message, enabled, st.session_state["session_id"])
@@ -140,6 +143,9 @@ def main(
     for message in st.session_state["messages"]:
         if message.get("role") == "assistant":
             content = message.get("content", "")
+            content, tagged_reasoning = split_reasoning_text(content)
+            if tagged_reasoning:
+                message["reasoning"] = [*message.get("reasoning", []), *tagged_reasoning]
             message["content"] = LEGACY_FALLBACK_MESSAGES.get(content, content)
     settings = st.session_state.setdefault("chat_settings", {})
     st.session_state.setdefault("session_id", uuid4().hex)
@@ -151,10 +157,13 @@ def main(
     with st.sidebar:
         st.title("Chat options")
         show_agent_activity = st.toggle(
-            "Show agent activity",
+            "Show processing steps",
             value=settings.get("show_agent_activity", False),
             key="show_agent_activity",
-            help="Show checks, knowledge searches, and response timing under each answer.",
+            help=(
+                "Watch a scrolling log while the LLM works, including reasoning when "
+                "the model provides it. Saved steps can be shown without rerunning answers."
+            ),
         )
         settings["show_agent_activity"] = show_agent_activity
         if public:
@@ -412,20 +421,6 @@ def main(
                 "text/plain",
                 width="stretch",
             )
-        if not public:
-            with st.expander("Request human review"):
-                review_question = st.text_area("Question for human review", max_chars=4000)
-                if st.button("Save human review request", disabled=not review_question.strip()):
-                    try:
-                        ticket = create_handoff(review_question, "manual_request", session_id)
-                        st.session_state["manual_handoff"] = ticket
-                    except OSError:
-                        st.error(
-                            "The review request could not be saved. Contact Medibank directly."
-                        )
-                if st.session_state.get("manual_handoff"):
-                    show_handoff(st.session_state["manual_handoff"])
-
     st.title("Medibank Assistant")
     st.caption(
         "General information about membership, benefits, claims, exclusions, and waiting periods."
@@ -474,7 +469,6 @@ def main(
                 if message["role"] == "assistant"
                 else answer_markdown(content)
             )
-            show_sources(message.get("sources", []))
             if message["role"] == "assistant":
                 show_activity(message, show_agent_activity, session_id)
             if message.get("handoff"):
@@ -511,9 +505,48 @@ def main(
         with st.chat_message("user"):
             st.markdown(answer_markdown(question))
         with st.chat_message("assistant"):
+            progress_output = None
+            if show_agent_activity:
+                with st.expander("Processing steps", expanded=True):
+                    with st.container(height=220, autoscroll=True):
+                        progress_output = st.empty()
+            processing_log = ""
+            last_progress_type = None
+            last_progress_render = 0.0
+            received_reasoning = False
+
+            def record_progress(event: dict[str, str]) -> None:
+                nonlocal processing_log, last_progress_type, last_progress_render
+                nonlocal received_reasoning
+                if progress_output is None:
+                    return
+                kind, text = event.get("type"), event.get("text", "")
+                if kind not in {"step", "reasoning"} or not text:
+                    return
+                if kind == "reasoning":
+                    received_reasoning = True
+                    if last_progress_type != "reasoning":
+                        processing_log += "\nModel-provided reasoning:\n"
+                    processing_log += text
+                else:
+                    elapsed = time.perf_counter() - started
+                    processing_log += f"\n[{elapsed:.1f}s] {text}\n"
+                processing_log = redact(processing_log[-8000:])
+                last_progress_type = kind
+                now = time.perf_counter()
+                if kind == "step" or now - last_progress_render >= 0.08:
+                    progress_output.text(processing_log)
+                    last_progress_render = now
+
             try:
                 with st.spinner("Checking Medibank information…"):
+                    record_progress(
+                        {"type": "step", "text": "Checking the question and knowledge base…"}
+                    )
                     decision = assess_question(question, st.session_state["messages"], index.store)
+                    record_progress(
+                        {"type": "step", "text": "Question and relevance checks completed."}
+                    )
                     audit(
                         "guardrail_decision",
                         level="INFO" if decision.allowed else "WARNING",
@@ -526,9 +559,13 @@ def main(
                     ticket = None
                     if not decision.allowed:
                         answer = Answer(decision.message, [])
+                        record_progress(
+                            {"type": "step", "text": "Preparing guidance for this request."}
+                        )
                         if decision.needs_human:
                             ticket = handoff_for(question, decision.reason, session_id, public)
                     else:
+                        record_progress({"type": "step", "text": f"Starting {chat_name}…"})
                         audit(
                             "chat_model_started",
                             session_id=session_id,
@@ -544,11 +581,16 @@ def main(
                             top_k=top_k,
                             request_id=request_id,
                             session_id=session_id,
+                            on_progress=record_progress if show_agent_activity else None,
                         )
                         if _abstention_only(answer.text):
                             ticket = handoff_for(
                                 question, "answer_not_supported", session_id, public
                             )
+                    if answer.reasoning and not received_reasoning:
+                        record_progress(
+                            {"type": "reasoning", "text": "\n\n".join(answer.reasoning)}
+                        )
                     audit(
                         "answer_completed",
                         session_id=session_id,
@@ -562,6 +604,7 @@ def main(
                         ],
                         elapsed_ms=round((time.perf_counter() - started) * 1000),
                     )
+                    record_progress({"type": "step", "text": "Response completed."})
                 st.session_state["messages"].extend(
                     [
                         {"role": "user", "content": question},
@@ -572,12 +615,15 @@ def main(
                             "handoff": ticket,
                             "request_id": request_id,
                             "activity": request_activity(request_id, session_id),
+                            "reasoning": answer.reasoning,
+                            "processing_log": processing_log,
                         },
                     ]
                 )
                 st.session_state.pop("last_chat_error", None)
                 st.rerun()
             except (ChatError, ValueError) as error:
+                record_progress({"type": "step", "text": "Response unavailable. Please retry."})
                 st.error(str(error))
                 audit(
                     "chat_failed",
@@ -595,8 +641,9 @@ def main(
                     show_handoff(ticket)
                 except OSError:
                     st.info("Contact Medibank directly if you need a human representative.")
-                remember_error(question, request_id, str(error), ticket, show_agent_activity)
+                remember_error(question, request_id, str(error), ticket, False, processing_log)
             except Exception:
+                record_progress({"type": "step", "text": "Response unavailable. Please retry."})
                 audit(
                     "chat_failed",
                     level="ERROR",
@@ -620,7 +667,8 @@ def main(
                     request_id,
                     "This question could not be answered. Please retry or request human review.",
                     ticket,
-                    show_agent_activity,
+                    False,
+                    processing_log,
                 )
 
 

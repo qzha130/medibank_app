@@ -116,7 +116,7 @@ def test_public_sessions_share_index_but_keep_conversations_and_activity_separat
     assert first.session_state["session_id"] != second.session_state["session_id"]
     assert state["builds"] == 1
     second.toggle[0].set_value(True).run()
-    assert not any(item.label == "Agent activity" for item in second.expander)
+    assert not any(item.label == "Processing steps" for item in second.expander)
 
 
 def test_secrets_cannot_disable_public_mode(public_ui):

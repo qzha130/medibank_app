@@ -125,7 +125,7 @@ def create_chat_model(config: ProviderConfig) -> BaseChatModel:
     if config.provider == "gemini":
         from langchain_google_genai import ChatGoogleGenerativeAI
 
-        return ChatGoogleGenerativeAI(
+        model = ChatGoogleGenerativeAI(
             model=config.model,
             api_key=_gemini_key(config),
             vertexai=False,
@@ -135,4 +135,10 @@ def create_chat_model(config: ProviderConfig) -> BaseChatModel:
             max_retries=2,
             # Preserve Google's sampling defaults for Gemini 3+.
         )
+        # Request supplied summaries without changing the model's thinking budget.
+        # The adapter's static capability profiles predate the default 3.8 model.
+        normalized_name = config.model.removeprefix("models/")
+        if model.profile.get("reasoning_output", normalized_name == "gemini-3.8-flash"):
+            model.include_thoughts = True
+        return model
     raise ValueError("Choose Ollama, OpenAI, or Gemini as the model provider.")
