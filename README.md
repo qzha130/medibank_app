@@ -2,10 +2,6 @@
 
 A Streamlit chatbot that answers questions using **two PDFs**. It extracts page text, splits it into chunks, and stores embeddings in a persistent Chroma database. A LangChain agent searches those chunks and includes the PDF filename and page in its answers.
 
-For a public website, deploy **`public_app.py`** using the [free hosting guide](DEPLOYMENT.md). It prepares Chroma automatically and keeps server credentials and administrative pages out of the public chat interface. Use **`app.py`** for the full local interface.
-
-Choose the chat model and embedding model independently: use local Ollama, online OpenAI, online Gemini, or mix providers. Local defaults are `llama3.1:8b` for chat and `nomic-embed-text` for embeddings. OpenAI defaults are `gpt-4.1-mini` and `text-embedding-3-small`. Gemini defaults are the stable [`gemini-3.8-flash`](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash) chat model and `gemini-embedding-001` for embeddings.
-
 ## Run on Windows
 
 Open PowerShell in this project and run setup once. It creates a Python 3.12 environment, installs the tested dependencies, and copies `.env.example` to `.env` only when that file does not already exist:
